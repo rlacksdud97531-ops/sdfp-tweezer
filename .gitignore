@@ -14,6 +14,10 @@ venv/
 poh_*.png
 reconstruction.png
 
+# Logs (but keep trained checkpoint.pt so the app runs without retraining)
+*.log
+sdfp/train_full.log
+
 # macOS
 .DS_Store
 
