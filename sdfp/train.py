@@ -178,12 +178,13 @@ def train_predictor(sur, samples, shape, device, epochs=20, bs=8,
                     l_uni = l_uni + vals.std() / (vals.mean() + 1e-9)
             l_geo = l_geo / len(batch)
             l_uni = l_uni / len(batch)
-            # 효율: 스팟영역 에너지 비율 (-log 으로 강하게 최대화)
-            eff = (Ipred * mask).sum() / (Ipred.sum() + 1e-9)
-            l_eff = -torch.log(eff + 1e-3)
-            eff_frac = float(eff.detach())
+            # 배경(스팟 마스크 밖) 에너지 억제 → 효율↑.
+            # 마스크 '밖'에만 걸어서 '소수 점만 밝히는' 부작용 없음 (균일도는 l_geo 가 유지).
+            l_bg = (Ipred * (1.0 - mask)).sum(dim=(1, 2)).mean() / (shape[0] * shape[1])
+            # 진단용 효율 (스팟영역 에너지 비율)
+            eff_frac = float(((Ipred * mask).sum() / (Ipred.sum() + 1e-9)).detach())
 
-            loss = l_geo + u_w * l_uni + eff_w * l_eff
+            loss = l_geo + u_w * l_uni + eff_w * l_bg
             opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item() * len(batch)
             tot_eff += eff_frac * len(batch)
@@ -242,9 +243,13 @@ def main():
     if args.quick:
         n_pairs, sur_ep, n_train, pred_ep, n_refine = 200, 25, 120, 24, 2
     else:
-        n_pairs, sur_ep, n_train, pred_ep, n_refine = 700, 40, 900, 70, 3
+        # 더 많은 데이터 = 일반화 격차/분산 감소 (효율 편차가 실질 문제였음)
+        n_pairs, sur_ep, n_train, pred_ep, n_refine = 700, 40, 1600, 90, 2
 
     optics = SimOptics(shape=shape, device=device, read_noise=0.01, seed=0)
+    # 스윕 결과: 배경항(eff_w)·강한 uni_w 는 효율↔균일도 frontier 를 후퇴시킴.
+    # 스팟 에너지 기하평균(eff_w=0, uni_w=0.5)이 최적 균형 → 데이터/에폭만 증량.
+    UNI_W, EFF_W = 0.5, 0.0
 
     t0 = time.time()
     print("STAGE 1: Surrogate 학습 (진짜 광학계 캘리브레이션 학습)")
@@ -252,8 +257,8 @@ def main():
 
     print("샘플 생성 + STAGE 2: Predictor distill")
     samples = make_samples(shape, n_train, device, seed=2)
-    net = train_predictor(sur, samples, shape, device,
-                          epochs=pred_ep, warmup_ep=pred_ep // 3)
+    net = train_predictor(sur, samples, shape, device, epochs=pred_ep,
+                          warmup_ep=pred_ep // 3, uni_w=UNI_W, eff_w=EFF_W)
     print(f"  [eval] {evaluate(net, optics, shape, device)}")
 
     # ── STAGE 3: DAgger refinement — surrogate-reality gap 닫기 ──
@@ -265,7 +270,7 @@ def main():
                               extra_phases=extra, lr=1e-3)
         net = train_predictor(sur, samples, shape, device,
                               epochs=max(10, pred_ep // 2), warmup_ep=0,
-                              net=net, lr=5e-4)
+                              uni_w=UNI_W, eff_w=EFF_W, net=net, lr=5e-4)
         print(f"  [eval] {evaluate(net, optics, shape, device)}")
     print(f"학습 완료 ({time.time()-t0:.1f}s)")
 
