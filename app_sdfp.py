@@ -28,6 +28,7 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import StrMethodFormatter, NullFormatter
 import streamlit as st
 from PIL import Image
 
@@ -296,6 +297,10 @@ with tab_conv:
         ax[1].axhline(ref["eff_pct"], color="#2BA84A", ls="--", lw=1.6,
                       label=f"SDFP {ref['eff_pct']}%")
         ax[1].set_xscale("log")
+        # 로그축 눈금을 일반 텍스트로 — mathtext 미사용 (최신 mpl/pyparsing 조합에서 파서 깨짐)
+        for axis in (ax[0].xaxis, ax[0].yaxis, ax[1].xaxis):
+            axis.set_major_formatter(StrMethodFormatter("{x:g}"))
+            axis.set_minor_formatter(NullFormatter())
         ax[1].set_xlabel("GS/WGS iterations"); ax[1].set_ylabel("Spot efficiency (%)")
         ax[1].set_title("Efficiency: comparable (≈3–4 pp above SDFP)", fontsize=11)
         ax[1].grid(True, alpha=0.3, which="both"); ax[1].legend(fontsize=9)
