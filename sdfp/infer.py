@@ -21,14 +21,26 @@ def load(checkpoint="sdfp/checkpoint.pt", device=None):
         else:
             device = "cpu"
     # 항상 CPU 로 먼저 로드 후 이동 — cuda 로 저장한 체크포인트도 CPU 전용 머신에서 안전.
-    ck = torch.load(checkpoint, map_location="cpu")
-    shape = tuple(ck["shape"])
-    refine = ck.get("surrogate_refine", False)   # 구버전 체크포인트 호환 (기본 False/32)
-    base = ck.get("unet_base", 32)
-    sur = Surrogate(shape, refine=refine)
-    sur.load_state_dict(ck["surrogate"]); sur = sur.to(device).eval()
-    net = UNet(base=base)
-    net.load_state_dict(ck["unet"]); net = net.to(device).eval()
+    ck = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    sur_sd, net_sd = ck["surrogate"], ck["unet"]
+    # 구조(해상도/refine 분기/base 폭)는 메타키가 아니라 state dict 자체에서 역산
+    # → torch 버전·체크포인트 세대와 무관하게 mismatch 불가능.
+    shape = tuple(sur_sd["A_raw"].shape)
+    refine = any(k.startswith("cnn.") for k in sur_sd)
+    base = int(net_sd["d1.net.0.weight"].shape[0])
+    try:
+        sur = Surrogate(shape, refine=refine)
+        sur.load_state_dict(sur_sd)
+        net = UNet(base=base)
+        net.load_state_dict(net_sd)
+    except RuntimeError as e:
+        meta = {k: v for k, v in ck.items() if k not in ("surrogate", "unet")}
+        raise RuntimeError(
+            f"[SDFP load] state_dict mismatch: ckpt={checkpoint} shape={shape} "
+            f"refine={refine} base={base} meta={meta} torch={torch.__version__}"
+        ) from e
+    sur = sur.to(device).eval()
+    net = net.to(device).eval()
     return net, sur, shape, device
 
 
