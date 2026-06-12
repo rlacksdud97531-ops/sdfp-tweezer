@@ -60,9 +60,11 @@ def spot_positions(array_type, shape, rows=4, cols=4, spacing=14,
     return np.array(pts, dtype=np.float64).T  # (2,N)
 
 
-def target_intensity(positions, shape, spot_sigma=1.2, device="cpu"):
+def target_intensity(positions, shape, spot_sigma=None, device="cpu"):
     """좌표 → 가우시안 스팟 강도맵 (에너지 합 = 1)."""
     H, W = shape
+    if spot_sigma is None:
+        spot_sigma = 1.2 * H / 128.0       # 해상도 비례 (128²=1.2px 와 동일 스케일)
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float64)
     img = np.zeros((H, W), dtype=np.float64)
     for x, y in zip(positions[0], positions[1]):
@@ -74,7 +76,8 @@ def target_intensity(positions, shape, spot_sigma=1.2, device="cpu"):
 def random_array(shape, rng):
     """학습용 무작위 배열 1개 (타입/크기/간격 랜덤)."""
     t = rng.choice(["Square", "Triangular", "Honeycomb", "Random"])
-    spacing = int(rng.integers(11, 20))
+    s = shape[0] / 128.0                   # 해상도 비례 스케일 (배열 레이아웃 일관)
+    spacing = int(rng.integers(round(11 * s), round(25 * s)))  # 슬라이더 범위+여유 → 외삽 붕괴 방지
     if t in ("Square", "Triangular"):
         rows = int(rng.integers(2, 6)); cols = int(rng.integers(2, 6))
         pos = spot_positions(t, shape, rows=rows, cols=cols, spacing=spacing, rng=rng)

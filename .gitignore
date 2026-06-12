@@ -20,6 +20,7 @@ sdfp/train_full.log
 
 # macOS
 .DS_Store
+__MACOSX/
 
 # Streamlit
 .streamlit/

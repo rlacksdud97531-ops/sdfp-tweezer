@@ -1,15 +1,17 @@
 """
 app_sdfp.py — Surrogate-Distilled Fast Predictor (Streamlit)
 
-Er / SU(8) 트위저용 POH 생성기 데모.
-  desired array → U-Net → POH (수 ms)  vs  GS / WGS (반복 최적화)
-세 방법의 POH 를 *수차가 있는 진짜 광학계 시뮬레이터* 에 통과시켜
-재구성 강도·균일도·효율·속도를 비교한다.
+POH generator demo for Er / SU(8) optical-tweezer arrays.
+  desired array → U-Net → POH (a few ms)  vs  GS / WGS (iterative)
+All three POHs are propagated through a *simulated real optical system*
+(aberrations + SLM non-linearity) and compared on reconstruction
+intensity, uniformity, efficiency and speed.
 
-⚠️ 아직 실험 데이터가 없으므로 "진짜 광학계" 는 시뮬레이터(SimOptics)로 대체.
-   실험 데이터가 생기면 Surrogate 만 그 데이터로 다시 학습하면 동일 구조로 작동.
+⚠️ No experimental data yet, so the "real optics" is a simulator (SimOptics).
+   Once camera data is available, only the Surrogate needs to be retrained —
+   the same pipeline then works unchanged.
 
-실행:
+Run:
     source venv/bin/activate
     streamlit run app_sdfp.py
 """
@@ -35,14 +37,15 @@ st.set_page_config(page_title="SDFP — Er Tweezer POH", page_icon="⚛️", lay
 
 st.title("⚛️ Surrogate-Distilled Fast Predictor")
 st.markdown(
-    "**Er / SU(8) 트위저용 POH 생성** — U-Net(빠름) vs GS/WGS(반복), "
-    "수차 있는 광학계에서의 균일도 비교"
+    "**POH generation for Er / SU(8) tweezer arrays** — U-Net (fast) vs GS/WGS "
+    "(iterative), compared on an aberrated optical system"
 )
 
 st.warning(
-    "아직 **실험 데이터가 없어서**, '진짜 광학계' 는 수차·SLM 비선형성을 주입한 "
-    "**시뮬레이터(SimOptics)** 로 대체했습니다. 실험 데이터가 생기면 Surrogate 만 "
-    "카메라 데이터로 다시 학습하면 동일한 파이프라인이 그대로 작동합니다.",
+    "No **experimental data** yet — the \"real optical system\" is replaced by a "
+    "**simulator (SimOptics)** with injected aberrations and SLM non-linearity. "
+    "Once camera data is available, only the Surrogate needs retraining; "
+    "the rest of the pipeline works unchanged.",
     icon="⚠️",
 )
 
@@ -55,7 +58,7 @@ def load_model(ckpt):
 
 @st.cache_resource
 def get_optics(shape, device):
-    # 학습에 사용한 광학계와 동일 파라미터 (seed=0)
+    # Same optics parameters as used in training (seed=0)
     return SimOptics(shape=shape, device=device, read_noise=0.0, seed=0)
 
 
@@ -67,71 +70,95 @@ def fig_bytes(fig):
 # ─────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
-    ckpt = st.text_input("Checkpoint", "sdfp/checkpoint.pt")
+    ckpt = st.text_input("Checkpoint", "sdfp/checkpoint_256.pt")
+    if not os.path.exists(ckpt):
+        st.error(f"Checkpoint not found: `{ckpt}`\n\n"
+                 "Train first:  `python -m sdfp.train --quick`")
+        st.stop()
+    net, sur, shape, device = load_model(ckpt)
+    sc = max(1, shape[0] // 128)   # layout scale vs the 128² reference
 
     st.subheader("Array")
     array_type = st.selectbox("Type", ["Square", "Triangular", "Honeycomb"])
-    spacing = st.slider("Spacing (px)", 11, 22, 15)
+    spacing = st.slider("Spacing (px)", 11 * sc, 24 * sc, 12 * sc,
+                        help=f"Training covered {11*sc}–{24*sc} px at {shape[0]}².")
     if array_type in ("Square", "Triangular"):
-        rows = st.slider("Rows", 2, 6, 4)
-        cols = st.slider("Cols", 2, 6, 4)
+        rows = st.slider("Rows", 2, 5, 4, help="Training covered 2–5 rows/cols.")
+        cols = st.slider("Cols", 2, 5, 4)
         rings = 2
     else:
-        rings = st.slider("Rings", 1, 3, 2)
+        rings = st.slider("Rings", 1, 2, 2)
         rows = cols = 4
 
     gs_iter = st.slider("GS/WGS iterations", 20, 150, 60, step=10)
+    refine_steps = st.slider(
+        "U-Net refine steps (test-time)", 0, 100, 40, step=10,
+        help="Polishes the U-Net output through the differentiable Surrogate to "
+             "equalize spot peaks (per-instance). "
+             "0 = raw U-Net · 40 ≈ balanced · 100 ≈ best quality "
+             "(nu≈0.2%, eff≈83%, ~0.4 s on GPU; slower on CPU). "
+             "More Adam steps beat L-BFGS in our benchmark.")
     run = st.button("▶ Run", type="primary", use_container_width=True)
 
 
-if not os.path.exists(ckpt):
-    st.error(f"체크포인트가 없습니다: `{ckpt}`\n\n"
-             "먼저 학습하세요:  `python -m sdfp.train --quick`")
-    st.stop()
-
-net, sur, shape, device = load_model(ckpt)
 optics = get_optics(shape, device)
+
+
+@st.cache_resource
+def _warmup(_net, _sur, _optics, shape, device):
+    """Pay the one-time JIT/CUDA init cost upfront so displayed timings are steady-state."""
+    d = torch.zeros(shape, device=device)
+    d[shape[0] // 2, shape[1] // 2] = 1.0
+    pk = np.array([[shape[1] // 2], [shape[0] // 2]])
+    INF.compare(_net, _sur, _optics, d, pk, device, gs_iter=5, refine_steps=3)
+    return True
+
+
+_warmup(net, sur, optics, shape, device)
 H, W = shape
-st.caption(f"device = `{device}`  ·  SLM = {W}×{H}  ·  학습된 모델 로드 완료")
+st.caption(f"device = `{device}`  ·  SLM = {W}×{H}  ·  trained model loaded")
 
 
 if not run:
-    with st.expander("🧠 구조 설명 (Surrogate-Distilled Fast Predictor)", expanded=True):
+    with st.expander("🧠 How it works (Surrogate-Distilled Fast Predictor)", expanded=True):
         st.markdown(
             """
-**문제**: Er 은 결맞음 시간이 짧다 → POH 를 매번 GS 로 반복 최적화할 시간이 없다.
-동시에 SU(8) 물리는 trap 균일도가 매우 중요하다.
+**Problem**: Er has a short coherence window → no time to re-run iterative GS
+for every POH. At the same time, SU(8) physics demands highly uniform traps.
 
-**아이디어**: 속도(U-Net)와 품질(미분가능 Surrogate)을 결합.
+**Idea**: combine speed (U-Net) with quality (differentiable Surrogate).
 
-1. **오프라인 — Surrogate 학습** (결맞음 제약 없음)
-   카메라 피드백으로 측정한 (위상 φ → 강도 I) 쌍으로 *진짜 광학계의 미분가능
-   모델* 을 학습. FFT 는 물리로 고정하고, 모르는 부분(SLM 감마, 조명 프로파일,
-   정적 수차)만 학습 → 광학계 캘리브레이션을 데이터로 역산.
+1. **Offline — train the Surrogate** (no coherence constraint)
+   Learn a *differentiable model of the real optics* from measured
+   (phase φ → intensity I) pairs. The FFT is fixed physics; only the unknown
+   parts (SLM gamma, illumination profile, static aberrations) are learned →
+   the optical calibration is inverted from data.
 
-2. **오프라인 — Predictor distill**
+2. **Offline — distill the Predictor**
    desired array → U-Net → φ → [frozen Surrogate] → I.
-   스팟 기하평균 최대화(효율+균일도) 손실로 U-Net 학습.
-   → U-Net 이 수차를 *미리 보정한* 위상을 예측하도록 distill.
+   The U-Net is trained with a spot geometric-mean loss (efficiency +
+   uniformity) → it learns phases that *pre-compensate* the aberrations.
 
-3. **온라인 — 추론** (결맞음 제약 O)
-   desired array → U-Net → POH, 수 ms. GS 의 수차-미보정 문제 없이 균일.
+3. **Online — inference** (coherence-limited)
+   desired array → U-Net → POH in a few ms, uniform on the real optics —
+   without GS's uncompensated-aberration problem.
 
-위상은 *직접 지도하지 않는다* (phase-retrieval 해는 비유일/스펙클).
-오직 재구성 강도만 미분가능 전파를 통해 최적화한다.
+Phases are *never supervised directly* (phase-retrieval solutions are
+non-unique / speckled). Only the reconstructed intensity is optimized
+through differentiable propagation.
             """
         )
-    st.info("👈 설정 후 **▶ Run**")
+    st.info("👈 Configure settings, then press **▶ Run**")
     st.stop()
 
 
-# ── 타깃 생성 ──────────────────────────────────────────
+# ── Build target ──────────────────────────────────────
 pos = D.spot_positions(array_type, shape, rows=rows, cols=cols,
                        spacing=spacing, rings=rings)
 margin = 6
 if (pos[0].min() < margin or pos[0].max() > W - margin or
         pos[1].min() < margin or pos[1].max() > H - margin):
-    st.error("⚠️ 배열이 SLM 범위를 벗어납니다. Spacing/크기를 줄이세요.")
+    st.error("⚠️ The array exceeds the SLM area. Reduce spacing or array size.")
     st.stop()
 
 target = D.target_intensity(pos, shape, device=device)
@@ -140,13 +167,17 @@ n_spots = pos.shape[1]
 
 st.subheader(f"📊 {array_type} — {n_spots} spots")
 
-with st.spinner("GS / WGS / U-Net POH 생성 + 광학계 통과..."):
-    res = INF.compare(net, optics, target, peaks, device, gs_iter=gs_iter)
+with st.spinner("Generating GS / WGS / U-Net POHs + propagating through the optics..."):
+    res = INF.compare(net, sur, optics, target, peaks, device,
+                      gs_iter=gs_iter, refine_steps=refine_steps)
 
-# ── 결과 3열 ───────────────────────────────────────────
+# ── Three result columns ──────────────────────────────
 cols_ui = st.columns(3)
-for col, name in zip(cols_ui, ["GS", "WGS", "U-Net (SDFP)"]):
-    r = res[name]
+sdfp_title = f"U-Net + Refine×{refine_steps}" if refine_steps > 0 else "U-Net (SDFP)"
+for col, key, name in zip(cols_ui,
+                          ["GS", "WGS", "U-Net (SDFP)"],
+                          ["GS", "WGS", sdfp_title]):
+    r = res[key]
     with col:
         st.markdown(f"### {name}")
         m1, m2 = st.columns(2)
@@ -169,9 +200,9 @@ for col, name in zip(cols_ui, ["GS", "WGS", "U-Net (SDFP)"]):
                            file_name=f"poh_{name.split()[0].lower()}.png",
                            mime="image/png", use_container_width=True)
 
-# ── 요약 비교 ──────────────────────────────────────────
+# ── Summary ───────────────────────────────────────────
 st.divider()
-st.subheader("📈 비교 요약")
+st.subheader("📈 Summary")
 
 c1, c2 = st.columns([1, 1])
 with c1:
@@ -192,11 +223,12 @@ with c2:
     gs_nu = res["GS"]["nonunif"] * 100
     un_nu = res["U-Net (SDFP)"]["nonunif"] * 100
     imp = (gs_nu - un_nu) / gs_nu * 100 if gs_nu > 0 else 0
-    sp = res["GS"]["time"] / max(res["U-Net (SDFP)"]["time"], 1e-6)
+    sdfp_t = res["U-Net (SDFP)"]["time"] * 1000
     st.metric("GS non-uniformity", f"{gs_nu:.1f}%")
-    st.metric("U-Net non-uniformity", f"{un_nu:.1f}%",
+    st.metric("SDFP non-uniformity", f"{un_nu:.1f}%",
               delta=f"{un_nu - gs_nu:.1f}%", delta_color="inverse")
     st.metric("Uniformity improvement", f"{imp:.0f}%")
-    st.metric("Speed-up vs GS", f"{sp:.0f}×")
-    st.caption("U-Net 은 학습된 Surrogate 를 통해 수차를 미리 보정 → "
-               "GS 대비 더 균일하고 추론은 수 ms.")
+    st.metric("SDFP time", f"{sdfp_t:.0f} ms")
+    st.caption("SDFP = U-Net (high-efficiency warm start) + per-instance Surrogate "
+               "refinement (peak equalization). The calibrated Surrogate can be "
+               "swapped for camera feedback in a real experiment.")

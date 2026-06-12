@@ -14,12 +14,21 @@ from .metrics import nonuniformity, efficiency
 
 def load(checkpoint="sdfp/checkpoint.pt", device=None):
     if device is None:
-        device = ("mps" if torch.backends.mps.is_available()
-                  else "cuda" if torch.cuda.is_available() else "cpu")
-    ck = torch.load(checkpoint, map_location=device)
+        if torch.backends.mps.is_available():
+            device = "mps"
+        elif torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device = "cuda"
+        else:
+            device = "cpu"
+    # 항상 CPU 로 먼저 로드 후 이동 — cuda 로 저장한 체크포인트도 CPU 전용 머신에서 안전.
+    ck = torch.load(checkpoint, map_location="cpu")
     shape = tuple(ck["shape"])
-    sur = Surrogate(shape).to(device); sur.load_state_dict(ck["surrogate"]); sur.eval()
-    net = UNet().to(device); net.load_state_dict(ck["unet"]); net.eval()
+    refine = ck.get("surrogate_refine", False)   # 구버전 체크포인트 호환 (기본 False/32)
+    base = ck.get("unet_base", 32)
+    sur = Surrogate(shape, refine=refine)
+    sur.load_state_dict(ck["surrogate"]); sur = sur.to(device).eval()
+    net = UNet(base=base)
+    net.load_state_dict(ck["unet"]); net = net.to(device).eval()
     return net, sur, shape, device
 
 
@@ -36,9 +45,38 @@ def _now():
     return time.time()
 
 
-def compare(net, optics, target, peaks, device, gs_iter=60):
+def refine_phase(net, sur, target, peaks, device, steps=20, uni_w=0.5, lr=0.08):
+    """U-Net 출력을 warm-start 로, 미분가능 Surrogate 를 통해 스팟 *피크(중심픽셀)*
+    강도를 기하평균 최대화 + 균일화하도록 위상을 직접 미세조정 (per-instance).
+
+    피드포워드 U-Net 은 피크 정밀 균일화를 일반화하지 못하므로(배열마다 다른 해),
+    추론 시점에 보정된 Surrogate(≈실제 광학계)로 몇 스텝만 다듬는다.
+    U-Net 이 고효율 출발점을 주므로 효율을 유지한 채 균일도만 끌어올린다.
+    반환: (phase in [0,2π), time)."""
+    t0 = _now()
+    with torch.no_grad():
+        phase = (net(target.unsqueeze(0)).squeeze(0) % (2 * np.pi)).clone()
+    if steps <= 0:
+        return phase, _now() - t0
+    px = torch.as_tensor(peaks[0], device=device, dtype=torch.long)
+    py = torch.as_tensor(peaks[1], device=device, dtype=torch.long)
+    for p in sur.parameters():
+        p.requires_grad_(False)
+    sur.eval()
+    phase = phase.detach().requires_grad_(True)
+    opt = torch.optim.Adam([phase], lr=lr)
+    for _ in range(steps):
+        I = sur(phase)
+        vals = I[py, px]                       # 중심픽셀 = 피크(트랩 깊이), 지표와 정합
+        loss = -torch.log(vals + 1e-6).mean() + uni_w * vals.std() / (vals.mean() + 1e-9)
+        opt.zero_grad(); loss.backward(); opt.step()
+    return (phase.detach() % (2 * np.pi)), _now() - t0
+
+
+def compare(net, sur, optics, target, peaks, device, gs_iter=60, refine_steps=0):
     """GS / WGS / U-Net POH 를 진짜 광학계(optics)에 통과시켜 비교.
 
+    refine_steps>0 이면 U-Net(SDFP) 결과를 Surrogate 로 per-instance 미세조정.
     반환: dict[name] = {phase, recon, nonunif, eff, time}
     """
     out = {}
@@ -52,14 +90,18 @@ def compare(net, optics, target, peaks, device, gs_iter=60):
     p_wgs = gs(target, n_iter=gs_iter, weighted=True, device=device)
     t_wgs = time.time() - t
 
-    p_un, t_un = unet_phase(net, target, device)
+    if refine_steps > 0:
+        p_un, t_un = refine_phase(net, sur, target, peaks, device, steps=refine_steps)
+    else:
+        p_un, t_un = unet_phase(net, target, device)
 
+    radius = max(3, round(3 * target.shape[-1] / 128))   # 해상도 비례 측정 반경
     for name, phase, dt in [("GS", p_gs, t_gs),
                             ("WGS", p_wgs, t_wgs),
                             ("U-Net (SDFP)", p_un, t_un)]:
         recon = optics.forward(phase).detach()
-        nu, vals = nonuniformity(recon, peaks, radius=3)
-        eff = efficiency(recon, peaks, radius=3)
+        nu, vals = nonuniformity(recon, peaks, radius=radius)
+        eff = efficiency(recon, peaks, radius=radius)
         out[name] = {
             "phase": (phase % (2 * np.pi)).detach().cpu().numpy(),
             "recon": recon.cpu().numpy(),
