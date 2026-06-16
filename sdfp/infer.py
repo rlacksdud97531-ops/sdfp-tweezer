@@ -57,13 +57,15 @@ def _now():
     return time.time()
 
 
-def refine_phase(net, sur, target, peaks, device, steps=20, uni_w=0.5, lr=0.08):
+def refine_phase(net, sur, target, peaks, device, steps=20, uni_w=0.5, lr=0.08, eff_w=0.001):
     """U-Net 출력을 warm-start 로, 미분가능 Surrogate 를 통해 스팟 *피크(중심픽셀)*
     강도를 기하평균 최대화 + 균일화하도록 위상을 직접 미세조정 (per-instance).
 
     피드포워드 U-Net 은 피크 정밀 균일화를 일반화하지 못하므로(배열마다 다른 해),
     추론 시점에 보정된 Surrogate(≈실제 광학계)로 몇 스텝만 다듬는다.
     U-Net 이 고효율 출발점을 주므로 효율을 유지한 채 균일도만 끌어올린다.
+    eff_w: 피크 절댓값(선형)에 대한 패널티 — 특정 spacing 에서 낮은 피크 local
+    minimum 에 갇히는 현상을 방지한다. 기본 0.001 (log 그래디언트와 유사 스케일).
     반환: (phase in [0,2π), time)."""
     t0 = _now()
     with torch.no_grad():
@@ -80,7 +82,9 @@ def refine_phase(net, sur, target, peaks, device, steps=20, uni_w=0.5, lr=0.08):
     for _ in range(steps):
         I = sur(phase)
         vals = I[py, px]                       # 중심픽셀 = 피크(트랩 깊이), 지표와 정합
-        loss = -torch.log(vals + 1e-6).mean() + uni_w * vals.std() / (vals.mean() + 1e-9)
+        loss = (-torch.log(vals + 1e-6).mean()
+                + uni_w * vals.std() / (vals.mean() + 1e-9)
+                - eff_w * vals.mean())
         opt.zero_grad(); loss.backward(); opt.step()
     return (phase.detach() % (2 * np.pi)), _now() - t0
 
