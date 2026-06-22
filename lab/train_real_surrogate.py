@@ -32,7 +32,11 @@ def load_measured(data_dir, shape, device):
     """npz 폴더 → (phases[rad], intensities[평균≈1 스케일]) 텐서."""
     phases, intens, refs = [], [], []
     for f in sorted(Path(data_dir).glob("*.npz")):
+        if "darks" in f.stem:                 # darks.npz 는 학습데이터 아님 (meta 없음)
+            continue
         d = np.load(f, allow_pickle=True)
+        if "meta" not in d.files:             # 안전장치: meta 없는 npz 건너뜀
+            continue
         meta = json.loads(str(d["meta"]))
         u8 = d["phase_u8"].astype(np.float64)
         # 캔버스 임베드본이면 중앙 crop
